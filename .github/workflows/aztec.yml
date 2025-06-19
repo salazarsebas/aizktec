@@ -1,0 +1,138 @@
+name: Aztec Noir Smart Contracts CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  test-contracts:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Verify Docker is running
+        run: |
+          docker version
+          docker info
+
+      - name: Install and Verify Aztec Sandbox CLI tools
+        run: |
+          echo "Installing Aztec Sandbox CLI tools..."
+          bash -i <(curl -s https://install.aztec.network)
+
+          export PATH="$HOME/.aztec/bin:$PATH" # Add for current shell
+          echo "$HOME/.aztec/bin" >> $GITHUB_PATH # Add for subsequent steps
+
+          echo "Verifying Aztec CLI installation:"
+          aztec --version
+          aztec-nargo --version
+          aztec-up --version || echo "aztec-up verification failed, but continuing as it's not critical for this workflow."
+          aztec-wallet --version || echo "aztec-wallet verification failed, but continuing as it's not critical for this workflow."
+
+
+      - name: Start Aztec Sandbox and Wait for Readiness
+        run: |
+          echo "Starting Aztec Sandbox in the background..."
+          export PATH="$HOME/.aztec/bin:$PATH"
+
+          # Start aztec sandbox in the background and capture its logs
+          # We redirect stderr to stdout so we can grep all output
+          aztec start --sandbox > aztec_sandbox.log 2>&1 &
+
+          echo "Waiting for Aztec Sandbox to emit 'Aztec Server listening on port 8080'..."
+          # Max 5 minutes to see the "listening" message in the logs
+          LISTEN_START_TIME=$(date +%s)
+          LISTEN_END_TIME=$((LISTEN_START_TIME + 300)) # 5 minutes
+
+          while true; do
+            CURRENT_TIME=$(date +%s)
+            if [ "$CURRENT_TIME" -ge "$LISTEN_END_TIME" ]; then
+              echo "Aztec Sandbox did not emit 'Aztec Server listening on port 8080' within 5 minutes. Check aztec_sandbox.log for details."
+              cat aztec_sandbox.log # Output full log for debugging
+              exit 1
+            fi
+            grep -q "Aztec Server listening on port 8080" aztec_sandbox.log
+            if [ $? -eq 0 ]; then
+              echo "Aztec Sandbox is now listening on port 8080!"
+              break
+            fi
+            echo "Still waiting for 'Aztec Server listening' message... ($((LISTEN_END_TIME - CURRENT_TIME)) seconds left)"
+            sleep 10
+          done
+
+          echo "Waiting for Aztec Sandbox to be fully synced via HTTP status check..."
+          # Max 3 minutes to see the "synced" status via HTTP
+          SYNC_START_TIME=$(date +%s)
+          SYNC_END_TIME=$((SYNC_START_TIME + 180)) # 3 minutes
+
+          while true; do
+            CURRENT_TIME=$(date +%s)
+            if [ "$CURRENT_TIME" -ge "$SYNC_END_TIME" ]; then
+              echo "Aztec Sandbox failed to sync via HTTP status check within 3 minutes. Exiting."
+              exit 1
+            fi
+            # Use --fail-with-body to ensure curl exits with 22 if the status is not 200
+            curl -s --fail-with-body http://localhost:8080/status | grep -q "synced"
+            if [ $? -eq 0 ]; then
+              echo "Aztec Sandbox is running and synced!"
+              break
+            fi
+            echo "Waiting for sandbox 'synced' status... ($((SYNC_END_TIME - CURRENT_TIME)) seconds left)"
+            sleep 10
+          done
+          echo "Full Aztec Sandbox logs (after startup):"
+          cat aztec_sandbox.log
+
+
+      - name: Compile Smart Contracts
+        run: |
+          echo "Navigating to contract directory..."
+          cd ./packages/aztec/contracts/nft_contract
+          echo "Compiling smart contracts with aztec-nargo..."
+          export PATH="$HOME/.aztec/bin:$PATH"
+          aztec-nargo compile
+          echo "Smart contracts compiled successfully."
+
+      - name: Debug on Failure
+        if: failure()
+        run: |
+          echo "--- Debugging Information ---"
+          echo "Current directory contents:"
+          ls -la
+          echo "Contents of nargo.toml (if exists):"
+          cat ./nargo.toml || echo "nargo.toml not found"
+          echo "Docker status:"
+          docker info || echo "Docker is not running or accessible."
+          docker ps -a || echo "No Docker containers found."
+          echo "Aztec processes:"
+          ps aux | grep aztec || echo "No Aztec processes found."
+          echo "Network status for port 8080:"
+          lsof -i :8080 || echo "Port 8080 not in use." # This might still show "not in use" if curl fails
+          echo "Disk space:"
+          df -h
+          echo "System hardware information (limited on Linux runners):"
+          lscpu || true
+          free -h || true
+          echo "Node.js version:"
+          node -v
+          echo "npm version:"
+          npm -v
+          echo "Attempting Aztec CLI versions in debug:"
+          export PATH="$HOME/.aztec/bin:$PATH"
+          aztec --version || echo "aztec not found in debug"
+          aztec-nargo --version || echo "aztec-nargo not found in debug"
+          aztec-up --version || echo "aztec-up not found or failed in debug"
+          aztec-wallet --version || echo "aztec-wallet not found or failed in debug"
+          echo "--- Aztec Sandbox Log from Start Step (if exists) ---"
+          cat aztec_sandbox.log || echo "aztec_sandbox.log not found."
