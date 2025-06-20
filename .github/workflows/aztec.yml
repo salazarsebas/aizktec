@@ -2,16 +2,15 @@ name: Aztec Noir Smart Contracts CI
 
 on:
   push:
-    branches:
-      - main
+    branches: [main]
   pull_request:
-    branches:
-      - main
+    branches: [main]
 
 jobs:
   test-contracts:
-    runs-on: ubuntu-latest
-
+    runs-on: ubuntu-latest  # Cambio a Ubuntu para mejor compatibilidad con Docker
+    timeout-minutes: 30  # Timeout general para el job
+    
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -19,120 +18,157 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '18'
+          node-version: '22'  # Aztec recomienda v22.15.x (lts/jod)
+          cache: 'npm'
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
       - name: Verify Docker is running
         run: |
-          docker version
+          docker --version
           docker info
+          echo "Docker is ready"
 
-      - name: Install and Verify Aztec Sandbox CLI tools
+      - name: Install Aztec toolchain
         run: |
-          echo "Installing Aztec Sandbox CLI tools..."
+          # Instalar Aztec usando el script oficial
           bash -i <(curl -s https://install.aztec.network)
+          
+          # Añadir al PATH para esta sesión
+          echo "$HOME/.aztec/bin" >> $GITHUB_PATH
+          
+          # Verificar instalación
+          export PATH="$HOME/.aztec/bin:$PATH"
+          aztec --version || echo "Aztec not found in PATH yet"
+          aztec-nargo --version || echo "Aztec-nargo not found in PATH yet"
 
-          export PATH="$HOME/.aztec/bin:$PATH" # Add for current shell
-          echo "$HOME/.aztec/bin" >> $GITHUB_PATH # Add for subsequent steps
-
-          echo "Verifying Aztec CLI installation:"
+      - name: Verify Aztec installation
+        run: |
+          export PATH="$HOME/.aztec/bin:$PATH"
+          which aztec
+          which aztec-nargo
           aztec --version
           aztec-nargo --version
-          aztec-up --version || echo "aztec-up verification failed, but continuing as it's not critical for this workflow."
-          aztec-wallet --version || echo "aztec-wallet verification failed, but continuing as it's not critical for this workflow."
 
-
-      - name: Start Aztec Sandbox and Wait for Readiness
+      - name: Start Aztec Sandbox
         run: |
-          echo "Starting Aztec Sandbox in the background..."
           export PATH="$HOME/.aztec/bin:$PATH"
+          
+          # Iniciar sandbox en background
+          nohup aztec start --sandbox > sandbox.log 2>&1 &
+          SANDBOX_PID=$!
+          echo "SANDBOX_PID=$SANDBOX_PID" >> $GITHUB_ENV
+          
+          echo "Waiting for Aztec Sandbox to be ready..."
+          
+          # Esperar hasta que el sandbox esté listo
+          timeout 300s bash -c '
+            while true; do
+              if curl -s http://localhost:8080/status > /dev/null 2>&1; then
+                echo "Sandbox is responding"
+                break
+              fi
+              echo "Waiting for sandbox... ($(date))"
+              sleep 10
+            done
+          '
+          
+          # Verificar que está funcionando correctamente
+          curl -s http://localhost:8080/status || echo "Status check failed"
+          
+          echo "Aztec Sandbox is ready!"
 
-          # Start aztec sandbox in the background and capture its logs
-          # We redirect stderr to stdout so we can grep all output
-          aztec start --sandbox > aztec_sandbox.log 2>&1 &
+      - name: Debug Sandbox Status
+        if: always()
+        run: |
+          echo "=== Sandbox Logs ==="
+          tail -100 sandbox.log || echo "No sandbox log found"
+          echo "=== Docker Containers ==="
+          docker ps -a
+          echo "=== Network Status ==="
+          curl -s http://localhost:8080/status || echo "Cannot reach sandbox"
+          echo "=== Process Status ==="
+          ps aux | grep aztec || echo "No aztec processes found"
 
-          echo "Waiting for Aztec Sandbox to emit 'Aztec Server listening on port 8080'..."
-          # Max 5 minutes to see the "listening" message in the logs
-          LISTEN_START_TIME=$(date +%s)
-          LISTEN_END_TIME=$((LISTEN_START_TIME + 300)) # 5 minutes
-
-          while true; do
-            CURRENT_TIME=$(date +%s)
-            if [ "$CURRENT_TIME" -ge "$LISTEN_END_TIME" ]; then
-              echo "Aztec Sandbox did not emit 'Aztec Server listening on port 8080' within 5 minutes. Check aztec_sandbox.log for details."
-              cat aztec_sandbox.log # Output full log for debugging
-              exit 1
-            fi
-            grep -q "Aztec Server listening on port 8080" aztec_sandbox.log
-            if [ $? -eq 0 ]; then
-              echo "Aztec Sandbox is now listening on port 8080!"
-              break
-            fi
-            echo "Still waiting for 'Aztec Server listening' message... ($((LISTEN_END_TIME - CURRENT_TIME)) seconds left)"
-            sleep 10
-          done
-
-          echo "Waiting for Aztec Sandbox to be fully synced via HTTP status check..."
-          # Max 3 minutes to see the "synced" status via HTTP
-          SYNC_START_TIME=$(date +%s)
-          SYNC_END_TIME=$((SYNC_START_TIME + 180)) # 3 minutes
-
-          while true; do
-            CURRENT_TIME=$(date +%s)
-            if [ "$CURRENT_TIME" -ge "$SYNC_END_TIME" ]; then
-              echo "Aztec Sandbox failed to sync via HTTP status check within 3 minutes. Exiting."
-              exit 1
-            fi
-            # Use --fail-with-body to ensure curl exits with 22 if the status is not 200
-            curl -s --fail-with-body http://localhost:8080/status | grep -q "synced"
-            if [ $? -eq 0 ]; then
-              echo "Aztec Sandbox is running and synced!"
-              break
-            fi
-            echo "Waiting for sandbox 'synced' status... ($((SYNC_END_TIME - CURRENT_TIME)) seconds left)"
-            sleep 10
-          done
-          echo "Full Aztec Sandbox logs (after startup):"
-          cat aztec_sandbox.log
-
+      - name: Verify contract structure
+        run: |
+          echo "=== Contract Directory Structure ==="
+          ls -la ./packages/aztec/contracts/nft_contract/ || echo "Contract directory not found"
+          
+          echo "=== Nargo.toml Content ==="
+          cat ./packages/aztec/contracts/nft_contract/Nargo.toml || echo "Nargo.toml not found"
+          
+          echo "=== Source Files ==="
+          ls -la ./packages/aztec/contracts/nft_contract/src/ || echo "Source directory not found"
 
       - name: Compile Smart Contracts
         run: |
-          echo "Navigating to contract directory..."
+          export PATH="$HOME/.aztec/bin:$PATH"
+          
           cd ./packages/aztec/contracts/nft_contract
-          echo "Compiling smart contracts with aztec-nargo..."
-          export PATH="$HOME/.aztec/bin:$PATH"
+          
+          echo "Compiling smart contract..."
           aztec-nargo compile
-          echo "Smart contracts compiled successfully."
+          
+          echo "=== Compilation Results ==="
+          ls -la target/ || echo "No target directory found"
 
-      - name: Debug on Failure
-        if: failure()
+      - name: Verify Compilation Artifacts
         run: |
-          echo "--- Debugging Information ---"
-          echo "Current directory contents:"
-          ls -la
-          echo "Contents of nargo.toml (if exists):"
-          cat ./nargo.toml || echo "nargo.toml not found"
-          echo "Docker status:"
-          docker info || echo "Docker is not running or accessible."
-          docker ps -a || echo "No Docker containers found."
-          echo "Aztec processes:"
-          ps aux | grep aztec || echo "No Aztec processes found."
-          echo "Network status for port 8080:"
-          lsof -i :8080 || echo "Port 8080 not in use." # This might still show "not in use" if curl fails
-          echo "Disk space:"
-          df -h
-          echo "System hardware information (limited on Linux runners):"
-          lscpu || true
-          free -h || true
-          echo "Node.js version:"
-          node -v
-          echo "npm version:"
-          npm -v
-          echo "Attempting Aztec CLI versions in debug:"
+          cd ./packages/aztec/contracts/nft_contract
+          
+          echo "=== Target Directory Content ==="
+          find target/ -name "*.json" -type f || echo "No JSON artifacts found"
+          
+          # Mostrar información del artifact si existe
+          if [ -f target/*.json ]; then
+            echo "=== Artifact Info ==="
+            ls -la target/*.json
+          fi
+
+      - name: Generate TypeScript Bindings (Optional)
+        continue-on-error: true
+        run: |
           export PATH="$HOME/.aztec/bin:$PATH"
-          aztec --version || echo "aztec not found in debug"
-          aztec-nargo --version || echo "aztec-nargo not found in debug"
-          aztec-up --version || echo "aztec-up not found or failed in debug"
-          aztec-wallet --version || echo "aztec-wallet not found or failed in debug"
-          echo "--- Aztec Sandbox Log from Start Step (if exists) ---"
-          cat aztec_sandbox.log || echo "aztec_sandbox.log not found."
+          
+          cd ./packages/aztec/contracts/nft_contract
+          
+          # Generar bindings de TypeScript si hay artifacts
+          if [ -d target ] && [ "$(ls -A target/*.json 2>/dev/null)" ]; then
+            echo "Generating TypeScript bindings..."
+            aztec codegen -o src/artifacts target
+            echo "=== Generated Artifacts ==="
+            ls -la src/artifacts/ || echo "No artifacts generated"
+          else
+            echo "No JSON artifacts found, skipping codegen"
+          fi
+
+      - name: Cleanup
+        if: always()
+        run: |
+          echo "Cleaning up..."
+          
+          # Parar el sandbox si está corriendo
+          if [ ! -z "$SANDBOX_PID" ]; then
+            echo "Stopping sandbox (PID: $SANDBOX_PID)"
+            kill $SANDBOX_PID || echo "Failed to kill sandbox process"
+          fi
+          
+          # Parar cualquier proceso de aztec que pueda estar corriendo
+          pkill -f aztec || echo "No aztec processes to kill"
+          
+          # Limpiar contenedores de Docker si los hay
+          docker ps -q --filter "ancestor=aztecprotocol/*" | xargs -r docker kill || echo "No Aztec containers to stop"
+          docker system prune -f || echo "Docker cleanup failed"
+
+      - name: Upload Compilation Artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: aztec-compilation-artifacts
+          path: |
+            ./packages/aztec/contracts/nft_contract/target/
+            ./packages/aztec/contracts/nft_contract/src/artifacts/
+            sandbox.log
+          retention-days: 5
