@@ -1,0 +1,174 @@
+name: Aztec Noir Smart Contracts CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test-contracts:
+    runs-on: ubuntu-latest  # Cambio a Ubuntu para mejor compatibilidad con Docker
+    timeout-minutes: 30  # Timeout general para el job
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'  # Aztec recomienda v22.15.x (lts/jod)
+          cache: 'npm'
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Verify Docker is running
+        run: |
+          docker --version
+          docker info
+          echo "Docker is ready"
+
+      - name: Install Aztec toolchain
+        run: |
+          # Instalar Aztec usando el script oficial
+          bash -i <(curl -s https://install.aztec.network)
+          
+          # Añadir al PATH para esta sesión
+          echo "$HOME/.aztec/bin" >> $GITHUB_PATH
+          
+          # Verificar instalación
+          export PATH="$HOME/.aztec/bin:$PATH"
+          aztec --version || echo "Aztec not found in PATH yet"
+          aztec-nargo --version || echo "Aztec-nargo not found in PATH yet"
+
+      - name: Verify Aztec installation
+        run: |
+          export PATH="$HOME/.aztec/bin:$PATH"
+          which aztec
+          which aztec-nargo
+          aztec --version
+          aztec-nargo --version
+
+      - name: Start Aztec Sandbox
+        run: |
+          export PATH="$HOME/.aztec/bin:$PATH"
+          
+          # Iniciar sandbox en background
+          nohup aztec start --sandbox > sandbox.log 2>&1 &
+          SANDBOX_PID=$!
+          echo "SANDBOX_PID=$SANDBOX_PID" >> $GITHUB_ENV
+          
+          echo "Waiting for Aztec Sandbox to be ready..."
+          
+          # Esperar hasta que el sandbox esté listo
+          timeout 300s bash -c '
+            while true; do
+              if curl -s http://localhost:8080/status > /dev/null 2>&1; then
+                echo "Sandbox is responding"
+                break
+              fi
+              echo "Waiting for sandbox... ($(date))"
+              sleep 10
+            done
+          '
+          
+          # Verificar que está funcionando correctamente
+          curl -s http://localhost:8080/status || echo "Status check failed"
+          
+          echo "Aztec Sandbox is ready!"
+
+      - name: Debug Sandbox Status
+        if: always()
+        run: |
+          echo "=== Sandbox Logs ==="
+          tail -100 sandbox.log || echo "No sandbox log found"
+          echo "=== Docker Containers ==="
+          docker ps -a
+          echo "=== Network Status ==="
+          curl -s http://localhost:8080/status || echo "Cannot reach sandbox"
+          echo "=== Process Status ==="
+          ps aux | grep aztec || echo "No aztec processes found"
+
+      - name: Verify contract structure
+        run: |
+          echo "=== Contract Directory Structure ==="
+          ls -la ./packages/aztec/contracts/nft_contract/ || echo "Contract directory not found"
+          
+          echo "=== Nargo.toml Content ==="
+          cat ./packages/aztec/contracts/nft_contract/Nargo.toml || echo "Nargo.toml not found"
+          
+          echo "=== Source Files ==="
+          ls -la ./packages/aztec/contracts/nft_contract/src/ || echo "Source directory not found"
+
+      - name: Compile Smart Contracts
+        run: |
+          export PATH="$HOME/.aztec/bin:$PATH"
+          
+          cd ./packages/aztec/contracts/nft_contract
+          
+          echo "Compiling smart contract..."
+          aztec-nargo compile
+          
+          echo "=== Compilation Results ==="
+          ls -la target/ || echo "No target directory found"
+
+      - name: Verify Compilation Artifacts
+        run: |
+          cd ./packages/aztec/contracts/nft_contract
+          
+          echo "=== Target Directory Content ==="
+          find target/ -name "*.json" -type f || echo "No JSON artifacts found"
+          
+          # Mostrar información del artifact si existe
+          if [ -f target/*.json ]; then
+            echo "=== Artifact Info ==="
+            ls -la target/*.json
+          fi
+
+      - name: Generate TypeScript Bindings (Optional)
+        continue-on-error: true
+        run: |
+          export PATH="$HOME/.aztec/bin:$PATH"
+          
+          cd ./packages/aztec/contracts/nft_contract
+          
+          # Generar bindings de TypeScript si hay artifacts
+          if [ -d target ] && [ "$(ls -A target/*.json 2>/dev/null)" ]; then
+            echo "Generating TypeScript bindings..."
+            aztec codegen -o src/artifacts target
+            echo "=== Generated Artifacts ==="
+            ls -la src/artifacts/ || echo "No artifacts generated"
+          else
+            echo "No JSON artifacts found, skipping codegen"
+          fi
+
+      - name: Cleanup
+        if: always()
+        run: |
+          echo "Cleaning up..."
+          
+          # Parar el sandbox si está corriendo
+          if [ ! -z "$SANDBOX_PID" ]; then
+            echo "Stopping sandbox (PID: $SANDBOX_PID)"
+            kill $SANDBOX_PID || echo "Failed to kill sandbox process"
+          fi
+          
+          # Parar cualquier proceso de aztec que pueda estar corriendo
+          pkill -f aztec || echo "No aztec processes to kill"
+          
+          # Limpiar contenedores de Docker si los hay
+          docker ps -q --filter "ancestor=aztecprotocol/*" | xargs -r docker kill || echo "No Aztec containers to stop"
+          docker system prune -f || echo "Docker cleanup failed"
+
+      - name: Upload Compilation Artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: aztec-compilation-artifacts
+          path: |
+            ./packages/aztec/contracts/nft_contract/target/
+            ./packages/aztec/contracts/nft_contract/src/artifacts/
+            sandbox.log
+          retention-days: 5
